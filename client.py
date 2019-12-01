@@ -5,29 +5,87 @@ using primitive building blocks.
 Author: Vadym Barda vadim.barda@gmail.com
 """
 import abc
+import copy
 import datetime
 import enum
 import logging
-from typing import Any, Dict, List, NamedTuple, Optional
+import pprint
+from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Set
 
 import arrow
 import funcy
+import pandas as pd
 import requests
 
 
 logger = logging.getLogger(__name__)
 
 
-# constant names
+# Constant names
+PATENT_TYPE_FIELD = "patent_type"
 PATENT_DATE_FIELD = "patent_date"
 INVENTOR_LAST_NAME_FIELD = "inventor_last_name"
 
-# defaults
+# Defaults
+DEFAULT_URL = "https://www.patentsview.org/api/patents/query"
 DEFAULT_START_DATE = datetime.date(2000, 1, 1)
 DEFAULT_PAGE = 1
 DEFAULT_PAGE_SIZE = 1000
 DEFAULT_MAX_RESULTS = 1000
-DEFAULT_TIMEOUT_SECONDS = 5
+DEFAULT_TIMEOUT_SECONDS = 10
+
+
+# Helpers
+
+def _is_flat_dictionary(d: Dict[str, Any]) -> bool:
+    """Check if a dictionary is flat."""
+    return all(not isinstance(value, (dict, list)) for value in d.values())
+
+
+def _get_next_states(d: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+    """Generate next states to visit when flattening a dictionary."""
+    for key, value in d.items():
+        if isinstance(value, list):
+            for child_value in value:
+                new_state = {
+                    **d,
+                    **{key: child_value}
+                }
+                yield new_state
+        elif isinstance(value, dict):
+            # Create a copy
+            new_state: Dict[str, Any] = copy.deepcopy(d)
+            new_state.pop(key)  # remove parent key
+            for child_key, child_value in value.items():
+                joined_key = "{}__{}".format(key, child_key)
+                new_state[joined_key] = child_value
+            yield new_state
+        else:
+            continue
+
+
+def _flatten(d: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+    """Produce multiple flattened dictionaries from a single nested dictionary."""
+    if _is_flat_dictionary(d):
+        yield d
+        stack = []
+    else:
+        stack = [d]
+
+    seen_state_hashes: Set[str] = set()
+    while stack:
+        state = stack.pop()
+        next_states = _get_next_states(state)
+        for state in next_states:
+            state_hash = pprint.pformat(state)
+            if state_hash in seen_state_hashes:
+                continue
+
+            seen_state_hashes.add(state_hash)
+            if _is_flat_dictionary(state):
+                yield state
+            else:
+                stack.append(state)
 
 # DSL
 
@@ -131,6 +189,7 @@ class Query:
         self.criterion = criterion
 
 
+@enum.unique
 class SortDirection(enum.Enum):
     """A generic representation of a SortDirection."""
     ASC = "asc"
@@ -178,10 +237,21 @@ class PatentSearchResponse(NamedTuple):
     count: int
     total_patent_count: int
 
+    def to_dataframe(self, flatten: bool = True) -> pd.DataFrame:
+        """Export search results into a pandas dataframe."""
+        transformer = _flatten if flatten else funcy.identity
+        transformed_hits = funcy.flatten(transformer(hit) for hit in self.hits)
+        return pd.DataFrame(transformed_hits)
+
+    def __repr__(self):
+        """Override display to ignore hits."""
+        return (
+            "{} (count: {}, total_patent_count: {})"
+            .format(self.__class__.__name__, self.count, self.total_patent_count)
+        )
+
 
 # Client
-
-URL = "https://www.patentsview.org/api/patents/query"
 
 
 class PatentsViewClient:
@@ -193,7 +263,7 @@ class PatentsViewClient:
     ) -> None:
         """Initialize with a URL."""
         if url is None:
-            url = URL
+            url = DEFAULT_URL
         if timeout_seconds is None:
             timeout_seconds = DEFAULT_TIMEOUT_SECONDS
 
